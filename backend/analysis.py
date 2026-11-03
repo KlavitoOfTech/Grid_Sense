@@ -19,6 +19,7 @@ CONFIG = {
     "fuel_price_per_litre": 1000.0,   # NGN per litre of petrol - verify locally
     "gen_litres_per_kwh": 0.8,        # litres burned per kWh made (small generator)
     "gen_maintenance_per_kwh": 20.0,  # NGN per kWh for oil, servicing, wear
+    "generator_rate_per_kwh": None,   # set per user; overrides the fuel-based estimate
     "peak_hours": (18, 22),           # hours treated as the evening peak window
 }
 
@@ -34,6 +35,8 @@ def _cfg(config: dict | None) -> dict:
 def generator_cost_per_kwh(config: dict | None = None) -> float:
     """What one kWh from the generator really costs (fuel + maintenance)."""
     c = _cfg(config)
+    if c.get("generator_rate_per_kwh") is not None:
+        return float(c["generator_rate_per_kwh"])
     return c["gen_litres_per_kwh"] * c["fuel_price_per_litre"] + c["gen_maintenance_per_kwh"]
 
 

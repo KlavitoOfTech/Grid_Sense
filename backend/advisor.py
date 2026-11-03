@@ -19,20 +19,18 @@ import base64
 import json
 import os
 import re
-from datetime import datetime
 
-import pandas as pd
 from dotenv import load_dotenv
 
 import analysis
-from data import DATA_DIR, load_or_create
+import forecast
+import store
 
 load_dotenv()
 
 MODEL = "muse-spark-1.3"
 BASE_URL = "https://api.meta.ai/v1"
 MAX_TURNS = 6
-ENTRIES_PATH = DATA_DIR / "entries.json"
 
 SYSTEM_PROMPT = """You are GridSense, an energy advisor for households and small
 businesses with unreliable grid power in Nigeria. Always call the tools to get the
@@ -42,56 +40,24 @@ specific actions with an estimated saving. If data is missing, say so plainly.""
 
 
 # ---------------------------------------------------------------------------
-# Data and logged entries
-# ---------------------------------------------------------------------------
-_df = None
-
-
-def get_df() -> pd.DataFrame:
-    global _df
-    if _df is None:
-        _df = load_or_create()
-    return _df
-
-
-def list_entries() -> list:
-    if not ENTRIES_PATH.exists():
-        return []
-    try:
-        return json.loads(ENTRIES_PATH.read_text())
-    except Exception:
-        return []
-
-
-def add_entry(entry: dict) -> dict:
-    """Save a confirmed reading (e.g. extracted from a photo) so the agent can see it."""
-    entries = list_entries()
-    entry = {**entry, "logged_at": datetime.now().isoformat(timespec="seconds")}
-    entries.append(entry)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ENTRIES_PATH.write_text(json.dumps(entries, indent=2))
-    return entry
-
-
-# ---------------------------------------------------------------------------
 # Tools (run locally; Muse Spark decides when to call them)
 # ---------------------------------------------------------------------------
-def tool_get_cost_summary() -> dict:
-    return analysis.cost_summary(get_df())
+def tool_get_cost_summary(ctx) -> dict:
+    return analysis.cost_summary(ctx.df, ctx.config)
 
 
-def tool_get_peaks() -> dict:
-    return analysis.peak_analysis(get_df())
+def tool_get_peaks(ctx) -> dict:
+    return analysis.peak_analysis(ctx.df, ctx.config)
 
 
-def tool_get_daily_totals(last_n_days: int = 7) -> list:
+def tool_get_daily_totals(ctx, last_n_days: int = 7) -> list:
     last_n_days = max(1, min(int(last_n_days), 60))
-    return analysis.daily_totals(get_df()).tail(last_n_days).to_dict(orient="records")
+    return analysis.daily_totals(ctx.df, ctx.config).tail(last_n_days).to_dict(orient="records")
 
 
-def tool_get_anomalies(max_results: int = 10) -> list:
+def tool_get_anomalies(ctx, max_results: int = 10) -> list:
     """Hours far above normal for that hour of day (median/MAD z-score)."""
-    df = get_df().copy()
+    df = ctx.df.copy()
     df["hour"] = df["timestamp"].dt.hour
     grp = df.groupby("hour")["demand_kwh"]
     median = grp.transform("median")
@@ -109,10 +75,10 @@ def tool_get_anomalies(max_results: int = 10) -> list:
     ]
 
 
-def tool_simulate_scenario(kwh_per_day_to_shift: float = 1.0) -> dict:
+def tool_simulate_scenario(ctx, kwh_per_day_to_shift: float = 1.0) -> dict:
     """What-if: move daily generator energy to hours when the grid is on."""
     kwh = float(kwh_per_day_to_shift)
-    s = analysis.cost_summary(get_df())
+    s = analysis.cost_summary(ctx.df, ctx.config)
     gen_per_day = s["generator_kwh"] / s["days"]
     shifted = min(max(kwh, 0.0), gen_per_day)
     per_kwh_saving = s["generator_rate_per_kwh"] - s["grid_rate_per_kwh"]
@@ -126,12 +92,20 @@ def tool_simulate_scenario(kwh_per_day_to_shift: float = 1.0) -> dict:
     }
 
 
-def tool_get_logged_entries() -> list:
+def tool_get_logged_entries(ctx) -> list:
     """Readings the user logged, e.g. from photos of meters, bills, fuel receipts."""
-    return list_entries()[-20:]
+    return store.list_entries(ctx.user_id)[-20:]
+
+
+def tool_get_forecast(ctx) -> dict:
+    """Expected usage for the next 24 hours, with how accurate the model has been."""
+    f = forecast.get_forecast(ctx.df, ctx.user_id)
+    return {"method": f["method"], "metrics": f["metrics"], "next_24h_kwh": f["next_24h_kwh"],
+            "peak_hour": f["peak_hour"], "hourly_kwh": [h["kwh"] for h in f["hours"]]}
 
 
 TOOL_FUNCTIONS = {
+    "get_forecast": tool_get_forecast,
     "get_cost_summary": tool_get_cost_summary,
     "get_peaks": tool_get_peaks,
     "get_daily_totals": tool_get_daily_totals,
@@ -141,6 +115,10 @@ TOOL_FUNCTIONS = {
 }
 
 TOOLS = [
+    {"type": "function", "name": "get_forecast",
+     "description": "Forecast of the user's energy use for the next 24 hours (hourly kWh, total, "
+                    "peak hour) and the model's measured accuracy.",
+     "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"type": "function", "name": "get_cost_summary",
      "description": "Overall energy use and cost: grid vs generator kWh and NGN, generator "
                     "share, outage hours, 30-day projection, and rates.",
@@ -174,7 +152,7 @@ TOOLS = [
 ]
 
 
-def run_tool(name: str, arguments_json: str) -> str:
+def run_tool(ctx, name: str, arguments_json: str) -> str:
     fn = TOOL_FUNCTIONS.get(name)
     if fn is None:
         return json.dumps({"error": f"Unknown tool: {name}"})
@@ -182,7 +160,7 @@ def run_tool(name: str, arguments_json: str) -> str:
         args = json.loads(arguments_json or "{}")
         if not isinstance(args, dict):
             raise ValueError("arguments must be a JSON object")
-        return json.dumps(fn(**args), default=str)
+        return json.dumps(fn(ctx, **args), default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -298,7 +276,7 @@ def _reasoning(effort):
     return {"reasoning": {"effort": effort}} if effort else {}
 
 
-def _run_tool_loop(client, prompt, effort=None):
+def _run_tool_loop(client, ctx, prompt, effort=None):
     """Let Muse Spark call tools until it stops asking. Returns (last_response, tools_used)."""
     tools_used = []
     response = client.responses.create(
@@ -311,7 +289,7 @@ def _run_tool_loop(client, prompt, effort=None):
         for call in calls:
             tools_used.append(call.name)
             outputs.append({"type": "function_call_output", "call_id": call.call_id,
-                            "output": run_tool(call.name, call.arguments)})
+                            "output": run_tool(ctx, call.name, call.arguments)})
         response = client.responses.create(
             model=MODEL, instructions=SYSTEM_PROMPT, input=outputs,
             previous_response_id=response.id, tools=TOOLS, **_reasoning(effort))
@@ -351,29 +329,29 @@ def _structured(client, schema_name, schema, input_, previous_response_id=None, 
 # ---------------------------------------------------------------------------
 # 1. ASK: tool-calling agent
 # ---------------------------------------------------------------------------
-def ask_advisor(question: str, client=None) -> dict:
+def ask_advisor(ctx, question: str, client=None) -> dict:
     tools_used = []
     try:
         client = client or _get_client()
-        response, tools_used = _run_tool_loop(client, question)
+        response, tools_used = _run_tool_loop(client, ctx, question)
         answer = (response.output_text or "").strip()
         if not answer:
             raise RuntimeError("Empty answer from model")
         return {"answer": answer, "tools_used": tools_used, "mode": "live"}
     except Exception as exc:
         print(f"[advisor] ask fallback: {exc}")
-        return {"answer": fallback_answer(), "tools_used": tools_used, "mode": "fallback"}
+        return {"answer": fallback_answer(ctx), "tools_used": tools_used, "mode": "fallback"}
 
 
 # ---------------------------------------------------------------------------
 # 2. PLAN: tools + high reasoning, then structured weekly plan
 # ---------------------------------------------------------------------------
-def generate_plan(client=None) -> dict:
+def generate_plan(ctx, client=None) -> dict:
     tools_used = []
     try:
         client = client or _get_client()
         response, tools_used = _run_tool_loop(
-            client,
+            client, ctx,
             "Build a practical plan to cut this user's energy costs. Investigate their "
             "costs, peaks, recent days, anomalies and any logged readings, and test at "
             "least one what-if scenario.",
@@ -388,18 +366,18 @@ def generate_plan(client=None) -> dict:
         return {"plan": plan, "tools_used": tools_used, "mode": "live"}
     except Exception as exc:
         print(f"[advisor] plan fallback: {exc}")
-        return {"plan": fallback_plan(), "tools_used": tools_used, "mode": "fallback"}
+        return {"plan": fallback_plan(ctx), "tools_used": tools_used, "mode": "fallback"}
 
 
 # ---------------------------------------------------------------------------
 # 3. ALERTS: the guardian
 # ---------------------------------------------------------------------------
-def generate_alerts(client=None) -> dict:
+def generate_alerts(ctx, client=None) -> dict:
     tools_used = []
     try:
         client = client or _get_client()
         response, tools_used = _run_tool_loop(
-            client,
+            client, ctx,
             "Act as a guardian. Check recent anomalies, the last 7 days of usage and "
             "outage hours, and the generator share. Decide what the user should be warned about.",
             effort="medium")
@@ -411,7 +389,7 @@ def generate_alerts(client=None) -> dict:
         return {"alerts": out["alerts"], "tools_used": tools_used, "mode": "live"}
     except Exception as exc:
         print(f"[advisor] alerts fallback: {exc}")
-        return {"alerts": fallback_alerts(), "tools_used": tools_used, "mode": "fallback"}
+        return {"alerts": fallback_alerts(ctx), "tools_used": tools_used, "mode": "fallback"}
 
 
 # ---------------------------------------------------------------------------
@@ -445,9 +423,9 @@ def extract_from_image(image_bytes: bytes, mime_type: str = "image/jpeg", client
 # ---------------------------------------------------------------------------
 # Fallbacks (so the demo never breaks)
 # ---------------------------------------------------------------------------
-def fallback_answer() -> str:
-    c = analysis.cost_summary(get_df())
-    p = analysis.peak_analysis(get_df())
+def fallback_answer(ctx) -> str:
+    c = analysis.cost_summary(ctx.df, ctx.config)
+    p = analysis.peak_analysis(ctx.df, ctx.config)
     top = p["top_peak_hours"][0]["hour"]
     return (
         f"Over {c['days']} days you used {c['total_kwh']} kWh costing about NGN "
@@ -457,8 +435,8 @@ def fallback_answer() -> str:
         f"is available is your biggest saving opportunity. (Offline summary - AI advisor unavailable.)")
 
 
-def fallback_plan() -> dict:
-    s = tool_simulate_scenario(1.5)
+def fallback_plan(ctx) -> dict:
+    s = tool_simulate_scenario(ctx, 1.5)
     return {
         "headline": "Shift heavy use to grid hours",
         "summary": "The generator is your most expensive source. Running heavy appliances "
@@ -476,9 +454,9 @@ def fallback_plan() -> dict:
     }
 
 
-def fallback_alerts() -> list:
+def fallback_alerts(ctx) -> list:
     out = []
-    anomalies = tool_get_anomalies(3)
+    anomalies = tool_get_anomalies(ctx, 3)
     if anomalies:
         a = anomalies[0]
         out.append({
@@ -493,12 +471,3 @@ def fallback_alerts() -> list:
                     "what_happened": "No unusual usage found.", "likely_cause": "-",
                     "action": "No action needed."})
     return out
-
-
-if __name__ == "__main__":
-    import sys
-
-    q = " ".join(sys.argv[1:]) or "Why is my energy bill so high and how can I cut it?"
-    result = ask_advisor(q)
-    print(f"[{result['mode']}] tools used: {result['tools_used']}\n")
-    print(result["answer"])

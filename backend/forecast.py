@@ -17,7 +17,7 @@ import pandas as pd
 LOOKBACK = 48
 HORIZON = 24
 _lock = threading.Lock()
-_cache = None
+_cache = {}
 
 
 def _time_features(ts: pd.DatetimeIndex) -> np.ndarray:
@@ -35,7 +35,7 @@ def baseline_next(series: np.ndarray, t: int) -> np.ndarray:
     return out
 
 
-def _train_gru(series, feats, split):
+def _train_gru(series, feats, split, future_ts):
     """Train the GRU on origins before `split`. Returns a predict(t) function."""
     import torch
     from torch import nn
@@ -80,7 +80,7 @@ def _train_gru(series, feats, split):
         if t + HORIZON <= len(feats):
             fut_feats = feats[t:t + HORIZON, :2]
         else:  # beyond the data: build future time features from the clock
-            fut_feats = _future_feats(t, len(feats))
+            fut_feats = _time_features(future_ts)[:, :2]
         fut = torch.tensor(fut_feats.reshape(1, -1).astype(np.float32))
         with torch.no_grad():
             return net(seq, fut).numpy()[0] * sd + mu
@@ -88,15 +88,9 @@ def _train_gru(series, feats, split):
     return predict
 
 
-_future_ts = None
-
-
-def _future_feats(t, n):
-    return _time_features(_future_ts)[:, :2]
 
 
 def compute_forecast(df: pd.DataFrame) -> dict:
-    global _future_ts
     df = df.sort_values("timestamp").reset_index(drop=True)
     series = df["demand_kwh"].to_numpy(dtype=float)
     ts = pd.DatetimeIndex(df["timestamp"])
@@ -104,7 +98,6 @@ def compute_forecast(df: pd.DataFrame) -> dict:
     split = int(n * 0.8)
     feats = _time_features(ts)
     future_ts = pd.date_range(ts[-1] + pd.Timedelta(hours=1), periods=HORIZON, freq="h")
-    _future_ts = future_ts
 
     # Evaluate on the held-out last 20%, one forecast per day
     test_origins = [t for t in range(split, n - HORIZON + 1, 24)]
@@ -113,7 +106,7 @@ def compute_forecast(df: pd.DataFrame) -> dict:
 
     gru_mae, method, pred = None, "baseline", baseline_next(series, n)
     try:
-        predict = _train_gru(series, feats, split)
+        predict = _train_gru(series, feats, split, future_ts)
         gru_mae = float(np.mean([np.abs(predict(t) - series[t:t + HORIZON]).mean() for t in test_origins]))
         if gru_mae < base_mae:
             method, pred = "gru", np.clip(predict(n), 0, None)
@@ -136,18 +129,22 @@ def compute_forecast(df: pd.DataFrame) -> dict:
     }
 
 
-def get_forecast(df: pd.DataFrame) -> dict:
-    """Compute once, then reuse (training takes a few seconds)."""
-    global _cache
+def get_forecast(df: pd.DataFrame, key: str = "default") -> dict:
+    """Compute once per user and data version, then reuse (training takes a few seconds)."""
+    if len(df) < 24 * 10:
+        raise ValueError("Not enough data for a forecast yet (need at least 10 days of hourly readings).")
+    version = (key, len(df), str(df["timestamp"].max()))
     with _lock:
-        if _cache is None:
-            _cache = compute_forecast(df)
-        return _cache
+        if version not in _cache:
+            if len(_cache) > 50:
+                _cache.clear()
+            _cache[version] = compute_forecast(df)
+        return _cache[version]
 
 
 if __name__ == "__main__":
     from data import load_or_create
 
-    r = get_forecast(load_or_create())
+    r = get_forecast(load_or_create(), 'demo')
     print(r["method"], r["metrics"])
     print("next 24h kWh:", r["next_24h_kwh"], "peak:", r["peak_hour"])
