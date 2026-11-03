@@ -94,8 +94,8 @@ def tool_simulate_scenario(ctx, kwh_per_day_to_shift: float = 1.0) -> dict:
 
 def tool_get_logged_entries(ctx) -> list:
     """Readings the user logged, e.g. from photos of meters, bills, fuel receipts."""
-    return store.list_entries(ctx.user_id)[-20:]
-
+    rows = store.list_entries(ctx.token, limit=20)
+    return [{k: v for k, v in r.items() if k != "image_path"} for r in rows]
 
 def tool_get_forecast(ctx) -> dict:
     """Expected usage for the next 24 hours, with how accurate the model has been."""
