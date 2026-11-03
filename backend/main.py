@@ -27,27 +27,51 @@ import advisor
 import analysis
 import forecast
 import store
+import os
+import time
+
+from collections import defaultdict, deque
 
 from auth import User, get_current_user
 
 
-app = FastAPI(title="GridSense API")
+IS_PROD = os.environ.get("ENVIRONMENT") == "production"
 
+app = FastAPI(
+    title="GridSense API",
+    docs_url=None if IS_PROD else "/docs",       # no public API explorer in production
+    redoc_url=None,
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 
-# ---------------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------------
-
+# Comma-separated list, e.g. "https://gridsense.vercel.app"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# Per-user rate limit so one account can't burn your AI credits. In memory, so it
+# resets on restart, and it only works while the API runs as a single process.
+_hits: dict = defaultdict(deque)
+
+
+def limit(name: str, max_calls: int, per_seconds: int = 3600):
+    def check(user: User = Depends(get_current_user)):
+        now = time.time()
+        q = _hits[(user.id, name)]
+        while q and q[0] < now - per_seconds:
+            q.popleft()
+        if len(q) >= max_calls:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait a while and try again.")
+        q.append(now)
+    return check
 
 
 # ---------------------------------------------------------------------------
