@@ -80,3 +80,17 @@ footer { margin-top: 3rem; font-size: 0.85rem; }
   .rates .bar { grid-column: 1 / -1; order: 3; }
   .askrow { flex-direction: column; }
 }
+
+.fc { margin-top: 1.5rem; }
+
+/* landing and auth */
+.hright { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+.cta { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.5rem; }
+.authbox { max-width: 420px; }
+.authbox form { display: grid; gap: 1rem; margin: 1rem 0; }
+.authbox label { display: grid; gap: 0.3rem; font-size: 0.9rem; color: var(--muted); }
+input[type="email"], input[type="password"] { font: inherit; color: var(--ink); background: transparent; border: 1px solid var(--rule); border-radius: 6px; padding: 0.55rem 0.7rem; width: 100%; }
+.error { color: var(--crit); font-weight: 500; }
+.notice { color: var(--grid); font-weight: 500; }
+.linkbtn { background: none; color: var(--ink); text-decoration: underline; padding: 0; font-weight: 500; }
