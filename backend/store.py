@@ -11,13 +11,15 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
+
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
+import analysis
 from data import DATA_DIR, generate_usage
 
 load_dotenv()
@@ -78,13 +80,35 @@ def fetch_readings(token: str) -> pd.DataFrame:
     return rows_to_df(rows)
 
 
-def fetch_settings(token: str) -> dict:
-    rows = _rest("GET", "energy_settings?select=grid_tariff,generator_rate&limit=1", token).json()
-    if not rows:
-        return {}
-    return {"grid_tariff_per_kwh": float(rows[0]["grid_tariff"]),
-            "generator_rate_per_kwh": float(rows[0]["generator_rate"])}
+SETTINGS_DEFAULTS = {
+    "currency": "NGN",
+    "grid_tariff": 209.5,
+    "generator_cost_mode": "per_kwh",
+    "generator_rate": 820.0,
+    "fuel_price_per_litre": 1000.0,
+    "gen_litres_per_kwh": 0.8,
+}
+_SETTINGS_COLS = "currency,grid_tariff,generator_cost_mode,generator_rate,fuel_price_per_litre,gen_litres_per_kwh"
 
+
+def fetch_settings_row(token: str) -> dict | None:
+    """The user's raw energy_settings row (RLS returns only their own), or None."""
+    rows = _rest("GET", f"energy_settings?select={_SETTINGS_COLS}&limit=1", token).json()
+    return rows[0] if rows else None
+
+
+def fetch_settings(token: str) -> dict:
+    """The user's settings as an analysis config. Empty if they have none yet."""
+    row = fetch_settings_row(token)
+    if not row:
+        return {}
+    cfg = {"currency": row["currency"], "grid_tariff_per_kwh": float(row["grid_tariff"])}
+    if row["generator_cost_mode"] == "fuel":
+        cfg["fuel_price_per_litre"] = float(row["fuel_price_per_litre"])
+        cfg["gen_litres_per_kwh"] = float(row["gen_litres_per_kwh"])
+    else:
+        cfg["generator_rate_per_kwh"] = float(row["generator_rate"])
+    return cfg
 
 # ---------------------------------------------------------------------------
 # Per-user context (short cache so one dashboard load doesn't re-query 8 times)
@@ -109,6 +133,59 @@ def invalidate(user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Onboarding and settings (profiles + energy_settings)
+# ---------------------------------------------------------------------------
+def get_settings_payload(user) -> dict:
+    """What the settings form needs. Missing values fall back to defaults so the form is pre-filled."""
+    prof = _rest("GET", f"profiles?select=account_name,user_type,city,state,onboarding_completed"
+                        f"&id=eq.{user.id}&limit=1", user.token).json()
+    prof = prof[0] if prof else {}
+    row = fetch_settings_row(user.token) or {}
+    e = {**SETTINGS_DEFAULTS, **{k: v for k, v in row.items() if v is not None}}
+    return {
+        "onboarding_completed": bool(prof.get("onboarding_completed")),
+        "profile": {
+            "account_name": prof.get("account_name") or "",
+            "user_type": prof.get("user_type") or "household",
+            "city": prof.get("city") or "",
+            "state": prof.get("state") or "",
+        },
+        "energy": {
+            "currency": e["currency"],
+            "grid_tariff": float(e["grid_tariff"]),
+            "generator_cost_mode": e["generator_cost_mode"],
+            "generator_rate": float(e["generator_rate"]),
+            "fuel_price_per_litre": float(e["fuel_price_per_litre"]),
+            "gen_litres_per_kwh": float(e["gen_litres_per_kwh"]),
+        },
+    }
+
+
+def save_settings(user, profile: dict, energy: dict) -> dict:
+    """Save both tables with the user's own token (RLS applies). Settings go first, so
+    onboarding is only marked complete if they were saved."""
+    fuel = energy["generator_cost_mode"] == "fuel"
+    _rest("POST", "energy_settings?on_conflict=user_id", user.token,
+          headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+          json={
+              "user_id": user.id,
+              "currency": energy["currency"],
+              "grid_tariff": energy["grid_tariff"],
+              "generator_cost_mode": energy["generator_cost_mode"],
+              "generator_rate": None if fuel else energy["generator_rate"],
+              "fuel_price_per_litre": energy["fuel_price_per_litre"] if fuel else None,
+              "gen_litres_per_kwh": energy["gen_litres_per_kwh"] if fuel else None,
+              "updated_at": datetime.now(timezone.utc).isoformat(),
+          })
+    row = {"id": user.id, **profile, "onboarding_completed": True}
+    if user.email:
+        row["email"] = user.email
+    _rest("POST", "profiles?on_conflict=id", user.token,
+          headers={"Prefer": "resolution=merge-duplicates,return=minimal"}, json=row)
+    invalidate(user.id)  # so the dashboard uses the new numbers immediately
+    return get_settings_payload(user)
+
+# ---------------------------------------------------------------------------
 # Demo data for a new user (stored in THEIR account, different for each user)
 # ---------------------------------------------------------------------------
 def seed_demo(user, days: int = 75) -> int:
@@ -116,7 +193,7 @@ def seed_demo(user, days: int = 75) -> int:
         return 0  # already has data; never mix demo data into real readings
     cfg = fetch_settings(user.token)
     grid = cfg.get("grid_tariff_per_kwh", 209.5)
-    gen = cfg.get("generator_rate_per_kwh", 820.0)
+    gen = analysis.generator_cost_per_kwh(cfg)
     seed = int(user.id.replace("-", ""), 16) % (2 ** 32)
     start = (pd.Timestamp.now(tz=LAGOS).normalize().tz_localize(None) - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
 

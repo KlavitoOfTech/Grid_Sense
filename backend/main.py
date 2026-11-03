@@ -12,7 +12,9 @@ analysis and the AI agent against them.
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import advisor
 import analysis
@@ -53,6 +55,36 @@ class Entry(BaseModel):
     appliance_watts: float | None = None
     summary: str = ""
 
+class ProfileIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    account_name: str = Field(min_length=1, max_length=120)
+    user_type: Literal["household", "business"]
+    city: str = Field(min_length=1, max_length=80)
+    state: str = Field(min_length=1, max_length=80)
+
+
+class EnergyIn(BaseModel):
+    currency: Literal["NGN", "USD", "GBP", "EUR"] = "NGN"
+    grid_tariff: float = Field(ge=0, le=1_000_000)
+    generator_cost_mode: Literal["per_kwh", "fuel"]
+    generator_rate: float | None = Field(default=None, ge=0, le=10_000_000)
+    fuel_price_per_litre: float | None = Field(default=None, ge=0, le=10_000_000)
+    gen_litres_per_kwh: float | None = Field(default=None, gt=0, le=10)
+
+    @model_validator(mode="after")
+    def mode_needs_its_fields(self):
+        if self.generator_cost_mode == "per_kwh" and self.generator_rate is None:
+            raise ValueError("Enter your generator cost per kWh")
+        if self.generator_cost_mode == "fuel" and (
+            self.fuel_price_per_litre is None or self.gen_litres_per_kwh is None
+        ):
+            raise ValueError("Enter the fuel price and litres burned per kWh")
+        return self
+
+
+class SettingsIn(BaseModel):
+    profile: ProfileIn
+    energy: EnergyIn
 
 # ---------------------------------------------------------------------------
 # Public
@@ -76,6 +108,17 @@ def demo_data(user: User = Depends(get_current_user)):
     """Give a new user sample data in their own account (does nothing if they already have data)."""
     n = store.seed_demo(user)
     return {"seeded": n}
+
+@app.get("/settings")
+def get_settings(user: User = Depends(get_current_user)):
+    """The user's saved profile and energy settings (defaults pre-filled if none yet)."""
+    return store.get_settings_payload(user)
+
+
+@app.put("/settings")
+def put_settings(body: SettingsIn, user: User = Depends(get_current_user)):
+    """Create or update the user's profile and energy settings. Used by onboarding and the settings page."""
+    return store.save_settings(user, body.profile.model_dump(), body.energy.model_dump())
 
 
 # ---------------------------------------------------------------------------

@@ -143,7 +143,7 @@ def cost_summary(df: pd.DataFrame, config: dict | None = None) -> dict:
     saving_if_grid = gen_kwh * (gen_rate - c["grid_tariff_per_kwh"])
 
     return {
-        "currency": "NGN",
+        "currency": c.get("currency", "NGN"),
         "days": n_days,
         "total_kwh": round(grid_kwh + gen_kwh, 1),
         "grid_kwh": round(grid_kwh, 1),
