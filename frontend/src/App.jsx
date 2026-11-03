@@ -5,6 +5,7 @@ import { Landing, AuthForm } from "./Public";
 import Dashboard from "./Dashboard";
 import Onboarding from "./Onboarding";
 import Settings from "./Settings";
+import { AlertsPage, SavingsPage, AdvisorPage, ForecastPage, usePath, go } from "./Pages";
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -14,6 +15,8 @@ export default function App() {
   const [settings, setSettings] = useState(null);
   const [screen, setScreen] = useState("dashboard"); // dashboard | settings
   const [welcome, setWelcome] = useState(false);
+  const path = usePath();
+
 
   useEffect(() => {
     if (!supabase) { setReady(true); return; }
@@ -39,6 +42,7 @@ export default function App() {
     await supabase.auth.signOut();
     try { sessionStorage.clear(); } catch { /* ignore */ }
     setView("landing");
+    go("/");
   };
 
   if (!supabase) {
@@ -77,6 +81,13 @@ export default function App() {
       return <Settings user={user} welcome={welcome} onLogout={logout}
         onBack={() => { setScreen("dashboard"); setWelcome(false); }} />;
     }
+
+    const openSettings = () => setScreen("settings");
+    if (path === "/alerts") return <AlertsPage user={user} onLogout={logout} onOpenSettings={openSettings} />;
+    if (path === "/savings") return <SavingsPage user={user} onLogout={logout} onOpenSettings={openSettings} />;
+    if (path === "/advisor") return <AdvisorPage user={user} onLogout={logout} onOpenSettings={openSettings} />;
+    if (path === "/forecast") return <ForecastPage user={user} onLogout={logout} onOpenSettings={openSettings} />;
+
     return <Dashboard user={user} onLogout={logout} onOpenSettings={() => setScreen("settings")} />;
   }
 

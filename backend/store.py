@@ -38,6 +38,7 @@ class Ctx:
     user_id: str
     df: pd.DataFrame
     config: dict
+    token: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ def get_context(user) -> Ctx:
     df = fetch_readings(user.token)
     if df.empty:
         raise HTTPException(status_code=409, detail="no_data")
-    ctx = Ctx(user_id=user.id, df=df, config=fetch_settings(user.token))
+    ctx = Ctx(user_id=user.id, df=df, config=fetch_settings(user.token), token=user.token)
     _ctx_cache[user.id] = (time.time() + CONTEXT_SECONDS, ctx)
     return ctx
 
@@ -220,39 +221,161 @@ def _save(table: str, row: dict, token: str) -> None:
         print(f"[store] could not save to {table}: {exc}")
 
 
-def save_chat(user, question: str, answer: str) -> None:
-    _save("chat_history", {"question": question, "answer": answer}, user.token)
-
+def save_chat(user, question: str, answer: str, tools_used=None, mode=None) -> None:
+    _save("chat_history", {"user_id": user.id, "question": question, "answer": answer,
+                           "tools_used": tools_used or [], "mode": mode}, user.token)
 
 def save_plan(user, plan: dict) -> None:
     _save("savings_plans", {"plan": plan}, user.token)
 
 
 # ---------------------------------------------------------------------------
-# Logged readings from photos: one file per verified user id
+# Logged readings from photos (Supabase table logged_readings, RLS applies)
 # ---------------------------------------------------------------------------
-def _entry_path(user_id: str):
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
-        raise ValueError("bad user id")
-    return ENTRY_DIR / f"{user_id}.json"
+LOGGED_COLS = ("id,document_type,reading_date,kwh,amount_ngn,litres,price_per_litre_ngn,"
+               "meter_reading_kwh,appliance_watts,summary,confidence,image_path,created_at")
 
 
-def list_entries(user_id: str) -> list:
-    path = _entry_path(user_id)
-    if not path.exists():
-        return []
+def list_entries(token: str, limit: int = 200) -> list:
+    """The user's logged readings, newest first (RLS returns only their own)."""
+    limit = max(1, min(int(limit), 500))
+    return _rest("GET", f"logged_readings?select={LOGGED_COLS}"
+                        f"&order=created_at.desc&limit={limit}", token).json()
+
+
+def add_entry(user, entry: dict) -> dict:
+    path = entry.get("image_path")
+    if path and (not path.startswith(f"{user.id}/") or ".." in path):
+        raise HTTPException(status_code=422, detail="Invalid image path")
+    row = {
+        "user_id": user.id,
+        "document_type": entry["document_type"],
+        "reading_date": entry.get("date"),
+        "kwh": entry.get("kwh"),
+        "amount_ngn": entry.get("amount_ngn"),
+        "litres": entry.get("litres"),
+        "price_per_litre_ngn": entry.get("price_per_litre_ngn"),
+        "meter_reading_kwh": entry.get("meter_reading_kwh"),
+        "appliance_watts": entry.get("appliance_watts"),
+        "summary": entry.get("summary") or "",
+        "confidence": entry.get("confidence"),
+        "image_path": path,
+    }
+    r = _rest("POST", "logged_readings", user.token,
+              headers={"Prefer": "return=representation"}, json=row)
+    return r.json()[0]
+
+
+# ---------------------------------------------------------------------------
+# Persistent AI results (analysis_runs, energy_alerts, savings_plans, chat_history)
+# ---------------------------------------------------------------------------
+SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
+_ALERT_COLS = "id,title,description,severity,likely_cause,action,created_at"
+
+
+def data_version(ctx: Ctx) -> str:
+    """Changes whenever the user's readings change; saved AI output is 'stale' when it differs."""
+    logged = _rest("GET", "logged_readings?select=id&limit=1000", ctx.token).json()
+    return f"{len(ctx.df)}|{ctx.df['timestamp'].max()}|{len(logged)}"
+
+
+def _json_safe(obj):
+    return json.loads(json.dumps(obj, default=str))
+
+
+def _create_run(user, ctx: Ctx, kind: str, tools_used, mode: str) -> dict:
+    row = {
+        "user_id": user.id, "kind": kind, "data_version": data_version(ctx),
+        "summary": _json_safe(analysis.build_summary(ctx.df, ctx.config)),
+        "tools_used": tools_used or [], "mode": mode,
+    }
+    return _rest("POST", "analysis_runs", user.token,
+                 headers={"Prefer": "return=representation"}, json=row).json()[0]
+
+
+def _delete_run(user, run_id: str) -> None:
     try:
-        return json.loads(path.read_text())
+        _rest("DELETE", f"analysis_runs?id=eq.{run_id}", user.token)
+    except Exception as exc:
+        print(f"[store] could not clean up run {run_id}: {exc}")
+
+
+def _alert_out(a: dict) -> dict:
+    a = dict(a)
+    a["what_happened"] = a.pop("description", None)  # the field name the dashboard already uses
+    return a
+
+
+def save_alert_run(user, ctx: Ctx, result: dict) -> None:
+    run = _create_run(user, ctx, "alerts", result.get("tools_used"), result["mode"])
+    rows = [{"user_id": user.id, "run_id": run["id"], "title": a["title"],
+             "description": a["what_happened"], "severity": a["severity"],
+             "likely_cause": a["likely_cause"], "action": a["action"]}
+            for a in result["alerts"]]
+    try:
+        if rows:
+            _rest("POST", "energy_alerts", user.token,
+                  headers={"Prefer": "return=minimal"}, json=rows)
     except Exception:
-        return []
+        _delete_run(user, run["id"])  # don't leave a "fresh" run with no alerts
+        raise
 
 
-def add_entry(user_id: str, entry: dict) -> dict:
-    from datetime import datetime
+def get_alerts_payload(user, ctx: Ctx) -> dict:
+    runs = _rest("GET", "analysis_runs?select=id,data_version,tools_used,mode,created_at"
+                        "&kind=eq.alerts&order=created_at.desc&limit=1", user.token).json()
+    if not runs:
+        return {"alerts": [], "mode": None, "tools_used": [], "created_at": None, "stale": True}
+    run = runs[0]
+    rows = _rest("GET", f"energy_alerts?select={_ALERT_COLS}&run_id=eq.{run['id']}&limit=50",
+                 user.token).json()
+    rows.sort(key=lambda a: SEVERITY_ORDER.get(a["severity"], 3))
+    return {"alerts": [_alert_out(a) for a in rows], "mode": run["mode"],
+            "tools_used": run["tools_used"], "created_at": run["created_at"],
+            "stale": run["data_version"] != data_version(ctx)}
 
-    entries = list_entries(user_id)
-    entry = {**entry, "logged_at": datetime.now().isoformat(timespec="seconds")}
-    entries.append(entry)
-    ENTRY_DIR.mkdir(parents=True, exist_ok=True)
-    _entry_path(user_id).write_text(json.dumps(entries, indent=2))
-    return entry
+
+def alert_history(token: str, limit: int = 100) -> list:
+    limit = max(1, min(int(limit), 300))
+    rows = _rest("GET", f"energy_alerts?select={_ALERT_COLS}&order=created_at.desc&limit={limit}",
+                 token).json()
+    return [_alert_out(a) for a in rows]
+
+
+def save_plan_run(user, ctx: Ctx, result: dict) -> None:
+    run = _create_run(user, ctx, "plan", result.get("tools_used"), result["mode"])
+    try:
+        _rest("POST", "savings_plans", user.token, headers={"Prefer": "return=minimal"},
+              json={"user_id": user.id, "plan": _json_safe(result["plan"]), "run_id": run["id"]})
+    except Exception:
+        _delete_run(user, run["id"])
+        raise
+
+
+def get_plan_payload(user, ctx: Ctx) -> dict:
+    rows = _rest("GET", "savings_plans?select=id,plan,created_at,analysis_runs(data_version,tools_used,mode)"
+                        "&order=created_at.desc&limit=1", user.token).json()
+    if not rows:
+        return {"plan": None, "mode": None, "tools_used": [], "created_at": None, "stale": False}
+    r = rows[0]
+    run = r.get("analysis_runs") or {}  # plans saved before Phase 6 have no run: shown as stale
+    return {"plan": r["plan"], "mode": run.get("mode", "live"), "tools_used": run.get("tools_used") or [],
+            "created_at": r["created_at"], "stale": run.get("data_version") != data_version(ctx)}
+
+
+def plan_history(token: str, limit: int = 20) -> list:
+    limit = max(1, min(int(limit), 100))
+    return _rest("GET", f"savings_plans?select=id,plan,created_at&order=created_at.desc&limit={limit}",
+                 token).json()
+
+
+def chat_history(token: str, limit: int = 100) -> list:
+    limit = max(1, min(int(limit), 300))
+    return _rest("GET", f"chat_history?select=id,question,answer,tools_used,mode,created_at"
+                        f"&order=created_at.desc&limit={limit}", token).json()
+
+
+def analysis_history(token: str, limit: int = 20) -> list:
+    limit = max(1, min(int(limit), 100))
+    return _rest("GET", f"analysis_runs?select=id,kind,created_at,mode,tools_used,summary"
+                        f"&order=created_at.desc&limit={limit}", token).json()
