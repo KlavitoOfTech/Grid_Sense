@@ -173,7 +173,59 @@ def build_summary(df: pd.DataFrame, config: dict | None = None) -> dict:
         "peaks": peak_analysis(df, config),
     }
 
+# ---------------------------------------------------------------------------
+# Simple daily baseline estimate (Phase 7)
+# ---------------------------------------------------------------------------
+def daily_baseline(df: pd.DataFrame, config: dict | None = None, window: int = 7) -> dict:
+    """Average of the most recent complete days, projected to a day and a 30-day month."""
+    c = _cfg(config)
+    d = df.copy()
+    d["date"] = d["timestamp"].dt.date
+    g = d.groupby("date").agg(
+        hours=("demand_kwh", "size"),
+        total_kwh=("demand_kwh", "sum"),
+        grid_kwh=("grid_kwh", "sum"),
+        generator_kwh=("generator_kwh", "sum"),
+    )
+    full = g[g["hours"] >= 24]  # skip partial days, they would drag the average down
+    if len(full) < 3:
+        raise ValueError("Need at least 3 complete days of readings for an estimate.")
 
+    recent = full.tail(window)
+    daily_kwh = float(recent["total_kwh"].mean())
+    grid_day = float(recent["grid_kwh"].mean())
+    gen_day = float(recent["generator_kwh"].mean())
+    tariff = float(c["grid_tariff_per_kwh"])
+    gen_rate = generator_cost_per_kwh(c)
+
+    trend = None
+    if len(full) >= 2 * window:
+        prev = float(full.iloc[-2 * window:-window]["total_kwh"].mean())
+        if prev > 0:
+            trend = round((daily_kwh - prev) / prev * 100, 1)
+
+    monthly_kwh = daily_kwh * 30
+    supplied = max(1e-9, grid_day + gen_day)
+    return {
+        "currency": c.get("currency", "NGN"),
+        "days_used": int(len(recent)),
+        "window_start": str(recent.index[0]),
+        "window_end": str(recent.index[-1]),
+        "predicted_daily_kwh": round(daily_kwh, 2),
+        "predicted_monthly_kwh": round(monthly_kwh, 1),
+        "daily_kwh_min": round(float(recent["total_kwh"].min()), 2),
+        "daily_kwh_max": round(float(recent["total_kwh"].max()), 2),
+        "trend_vs_previous_window_pct": trend,
+        "grid_tariff_per_kwh": tariff,
+        "generator_rate_per_kwh": round(gen_rate, 1),
+        "grid_share_pct": round(grid_day / supplied * 100, 1),
+        "generator_share_pct": round(gen_day / supplied * 100, 1),
+        "monthly_cost_all_grid": round(monthly_kwh * tariff),
+        "monthly_cost_expected_mix": round((grid_day * tariff + gen_day * gen_rate) * 30),
+        "method": f"Average of your last {len(recent)} complete days, projected over 30 days. "
+                  "A simple baseline, not a trained model.",
+    }
+    
 if __name__ == "__main__":
     from data import load_or_create
 
