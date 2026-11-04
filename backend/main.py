@@ -4,61 +4,79 @@ main.py - GridSense API.
 
 Every endpoint except "/" requires a logged-in user.
 
-Run:
+Run locally:
     uvicorn main:app --reload
+
+Production:
+    uvicorn main:app --host 0.0.0.0 --port $PORT
 
 Auth:
     Send Authorization: Bearer <Supabase access token>
 
-Identity comes only from the verified token (see auth.py), never from a user ID
-supplied by the client. Each request loads that user's own readings and runs
-the analysis and AI agent against them.
+Identity comes only from the verified token (see auth.py), never from a
+user ID supplied by the client.
 """
+
+import os
+import time
+from collections import defaultdict, deque
+from typing import Literal
 
 import pandas as pd
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Literal
-
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import advisor
 import analysis
 import forecast
 import store
-import os
-import time
-
-from collections import defaultdict, deque
 
 from auth import User, get_current_user
 
 
-IS_PROD = os.environ.get("ENVIRONMENT") == "production"
+# ---------------------------------------------------------------------------
+# Application configuration
+# ---------------------------------------------------------------------------
+
+ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
+
+# Production frontend and local development
+ALLOWED_ORIGINS.update({
+    "https://grid-sense-cyan.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+})
 
 app = FastAPI(
     title="GridSense API",
-    docs_url=None if IS_PROD else "/docs",       # no public API explorer in production
-    redoc_url=None,
-    openapi_url=None if IS_PROD else "/openapi.json",
+    description="GridSense Energy Intelligence Platform API",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
-# Comma-separated list, e.g. "https://gridsense.vercel.app"
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-    if o.strip()
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "PUT"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=list(ALLOWED_ORIGINS),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Per-user rate limit so one account can't burn your AI credits. In memory, so it
-# resets on restart, and it only works while the API runs as a single process.
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+# Per-user rate limit so one account can't burn AI credits.
+# In memory, so it resets on restart and works with a single process.
+
 _hits: dict = defaultdict(deque)
 
 
@@ -66,11 +84,18 @@ def limit(name: str, max_calls: int, per_seconds: int = 3600):
     def check(user: User = Depends(get_current_user)):
         now = time.time()
         q = _hits[(user.id, name)]
+
         while q and q[0] < now - per_seconds:
             q.popleft()
+
         if len(q) >= max_calls:
-            raise HTTPException(status_code=429, detail="Too many requests. Please wait a while and try again.")
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please wait a while and try again.",
+            )
+
         q.append(now)
+
     return check
 
 
@@ -493,9 +518,17 @@ def chat_history(user: User = Depends(get_current_user)):
 def analysis_history(user: User = Depends(get_current_user)):
     return store.analysis_history(user.token)
 
+
+# ---------------------------------------------------------------------------
+# Forecast baseline
+# ---------------------------------------------------------------------------
+
 @app.get("/forecast/baseline")
 def forecast_baseline(ctx: store.Ctx = Depends(get_ctx)):
     try:
         return analysis.daily_baseline(ctx.df, ctx.config)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        )
