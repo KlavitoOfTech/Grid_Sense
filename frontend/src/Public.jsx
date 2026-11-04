@@ -61,6 +61,7 @@ export function AuthForm({ mode, setMode, onBack }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [showPw, setShowPw] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -96,10 +97,18 @@ export function AuthForm({ mode, setMode, onBack }) {
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
             autoComplete="email" required />
         </label>
-        <label>Password
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-            autoComplete={signup ? "new-password" : "current-password"} required />
-        </label>
+        <div className="field">
+          <label htmlFor="password">Password</label>
+          <div className="pwfield">
+            <input id="password" type={showPw ? "text" : "password"} value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete={signup ? "new-password" : "current-password"} required />
+            <button type="button" className="pwtoggle" onClick={() => setShowPw((v) => !v)}
+              aria-label={showPw ? "Hide password" : "Show password"} aria-pressed={showPw}>
+              {showPw ? "Hide" : "Show"}
+            </button>
+          </div>
+        </div>
         {error && <p className="error" role="alert">{error}</p>}
         {notice && <p className="notice" role="status">{notice}</p>}
         <button type="submit" disabled={busy}>

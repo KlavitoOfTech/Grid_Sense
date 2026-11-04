@@ -94,3 +94,15 @@ input[type="email"], input[type="password"] { font: inherit; color: var(--ink); 
 .error { color: var(--crit); font-weight: 500; }
 .notice { color: var(--grid); font-weight: 500; }
 .linkbtn { background: none; color: var(--ink); text-decoration: underline; padding: 0; font-weight: 500; }
+
+/* password show/hide */
+.authbox .field { display: grid; gap: 0.3rem; }
+.authbox .field label { font-size: 0.9rem; color: var(--muted); }
+.pwfield { position: relative; }
+.pwfield input { padding-right: 4.5rem; }
+.authbox .pwtoggle {
+  position: absolute; right: 0.35rem; top: 50%; transform: translateY(-50%);
+  background: none; color: var(--ink); border: 0; padding: 0.3rem 0.6rem;
+  font-weight: 700; font-size: 0.85rem; text-decoration: underline; cursor: pointer;
+}
+.pwfield input[type="password"]::-ms-reveal { display: none; } /* Edge adds its own eye icon */
