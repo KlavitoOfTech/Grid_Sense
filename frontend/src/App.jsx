@@ -6,6 +6,7 @@ import Dashboard from "./Dashboard";
 import Onboarding from "./Onboarding";
 import Settings from "./Settings";
 import { AlertsPage, SavingsPage, AdvisorPage, ForecastPage, usePath, go } from "./Pages";
+import Splash from "./Splash";
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -53,11 +54,11 @@ export default function App() {
       </main>
     );
   }
-  if (!ready) return <main><p className="muted">Loading…</p></main>;
+  if (!ready) return <Splash />;
 
   if (session) {
     const user = session.user;
-    if (gate === "checking") return <main><p className="muted">Loading…</p></main>;
+    if (gate === "checking") return <Splash message="Getting your energy data ready…" />;
     if (gate === "error") {
       return (
         <main>

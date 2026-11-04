@@ -14,6 +14,7 @@ import {
 
 import { money, setCurrency } from "./money";
 import { AlertsPanel, PlanPanel, NavButtons, BaselinePanel } from "./Pages";
+import Splash from "./Splash";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -589,14 +590,7 @@ export default function Dashboard({
     );
   }
 
-  if (!d) {
-    return (
-      <main>
-        <h1>GridSense</h1>
-        <p className="muted">Loading your energy data…</p>
-      </main>
-    );
-  }
+   if (!d) return <Splash message="Loading your energy data…" />;
 
   const { cost: c } = d;
 
